@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -15,6 +16,7 @@ services:
 
   redis:
     image: redis:7
+    restart: unless-stopped
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
@@ -23,6 +25,7 @@ services:
 
   minio:
     image: minio/minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -55,6 +58,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile.server
+    restart: unless-stopped
     ports:
       - "8003:3000"
       - "9090:9090"
