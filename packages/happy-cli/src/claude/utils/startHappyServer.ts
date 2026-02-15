@@ -1,14 +1,10 @@
 /**
  * Happy MCP server
- * Provides Happy CLI specific tools including chat session title management.
- *
- * Uses stateful (session-based) transport: each initialize request creates a new
- * transport+McpServer pair, stored by session ID. Subsequent requests reuse the
- * existing transport for that session.
+ * Provides Happy CLI specific tools including chat session title management
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { createServer } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { AddressInfo } from "node:net";
 import { z } from "zod";
@@ -16,11 +12,30 @@ import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { randomUUID } from "node:crypto";
 
-/**
- * Creates and registers tools on a fresh McpServer instance.
- * Called once per session (each initialize request starts a new session).
- */
-function createMcpServer(client: ApiSessionClient): McpServer {
+export async function startHappyServer(client: ApiSessionClient) {
+    logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
+
+    // Handler that sends title updates via the client
+    const handler = async (title: string) => {
+        logger.debug('[happyMCP] Changing title to:', title);
+        try {
+            // Send title as a summary message, similar to title generator
+            client.sendClaudeSessionMessage({
+                type: 'summary',
+                summary: title,
+                leafUuid: randomUUID()
+            });
+            
+            return { success: true };
+        } catch (error) {
+            return { success: false, error: String(error) };
+        }
+    };
+
+    //
+    // Create the MCP server
+    //
+
     const mcp = new McpServer({
         name: "Happy MCP",
         version: "1.0.0",
@@ -33,63 +48,38 @@ function createMcpServer(client: ApiSessionClient): McpServer {
             title: z.string().describe('The new title for the chat session'),
         },
     }, async (args) => {
-        logger.debug('[happyMCP] Changing title to:', args.title);
-        try {
-            client.sendClaudeSessionMessage({
-                type: 'summary',
-                summary: args.title,
-                leafUuid: randomUUID()
-            });
-            logger.debug('[happyMCP] Title changed successfully');
+        const response = await handler(args.title);
+        logger.debug('[happyMCP] Response:', response);
+        
+        if (response.success) {
             return {
-                content: [{ type: 'text' as const, text: `Successfully changed chat title to: "${args.title}"` }],
+                content: [
+                    {
+                        type: 'text',
+                        text: `Successfully changed chat title to: "${args.title}"`,
+                    },
+                ],
                 isError: false,
             };
-        } catch (error) {
-            logger.debug('[happyMCP] Title change failed:', error);
+        } else {
             return {
-                content: [{ type: 'text' as const, text: `Failed to change chat title: ${String(error)}` }],
+                content: [
+                    {
+                        type: 'text',
+                        text: `Failed to change chat title: ${response.error || 'Unknown error'}`,
+                    },
+                ],
                 isError: true,
             };
         }
     });
 
-    return mcp;
-}
-
-export async function startHappyServer(client: ApiSessionClient) {
-    // Session state: maps session IDs to their transport+server pairs
-    const sessions: Record<string, { transport: StreamableHTTPServerTransport; mcp: McpServer }> = {};
-
-    async function handleRequest(req: IncomingMessage, res: ServerResponse) {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-        // Existing session — reuse its transport
-        if (sessionId && sessions[sessionId]) {
-            await sessions[sessionId].transport.handleRequest(req, res);
-            return;
-        }
-
-        // New session — create transport + MCP server
-        const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (id: string) => {
-                logger.debug('[happyMCP] Session initialized:', id);
-                sessions[id] = { transport, mcp };
-            }
-        });
-        transport.onclose = () => {
-            const sid = transport.sessionId;
-            if (sid && sessions[sid]) {
-                delete sessions[sid];
-                logger.debug('[happyMCP] Session closed:', sid);
-            }
-        };
-
-        const mcp = createMcpServer(client);
-        await mcp.connect(transport);
-        await transport.handleRequest(req, res);
-    }
+    const transport = new StreamableHTTPServerTransport({
+        // NOTE: Returning session id here will result in claude
+        // sdk spawn to fail with `Invalid Request: Server already initialized`
+        sessionIdGenerator: undefined
+    });
+    await mcp.connect(transport);
 
     //
     // Create the HTTP server
@@ -97,9 +87,9 @@ export async function startHappyServer(client: ApiSessionClient) {
 
     const server = createServer(async (req, res) => {
         try {
-            await handleRequest(req, res);
+            await transport.handleRequest(req, res);
         } catch (error) {
-            logger.debug('[happyMCP] Error handling request:', error);
+            logger.debug("Error handling request:", error);
             if (!res.headersSent) {
                 res.writeHead(500).end();
             }
@@ -113,14 +103,14 @@ export async function startHappyServer(client: ApiSessionClient) {
         });
     });
 
+    logger.debug(`[happyMCP] server:ready sessionId=${client.sessionId} url=${baseUrl.toString()}`);
+
     return {
         url: baseUrl.toString(),
         toolNames: ['change_title'],
         stop: () => {
-            logger.debug('[happyMCP] Stopping server');
-            for (const session of Object.values(sessions)) {
-                session.mcp.close();
-            }
+            logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
+            mcp.close();
             server.close();
         }
     }
